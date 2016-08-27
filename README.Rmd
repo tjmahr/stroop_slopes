@@ -1,0 +1,138 @@
+---
+title: "Does the stroop effect vary across people?"
+author: "TJ Mahr"
+date: "August 26, 2016"
+output: github_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  comment = "#>", 
+  collapse = TRUE)
+```
+
+An attempt to work through [this example](https://jeffrouder.blogspot.com/2016/08/where-bayes-and-classical-inference.html).
+
+
+## Download and prepare data
+
+```{r}
+library(dplyr, warn.conflicts = FALSE)
+library(lme4)
+library(rstanarm)
+options(mc.cores = parallel::detectCores())
+
+# Download dataset
+filename <- curl::curl("https://raw.githubusercontent.com/PerceptionCognitionLab/data0/master/contexteffects/FlankerStroopSimon/LEF_stroop.csv")
+raw_stroop <- readr::read_csv2(filename)
+
+# Keep a local copy just in case
+readr::write_csv(raw_stroop, "./stroop_data.csv")
+
+# Data cleaning
+stroop <- raw_stroop %>%
+  # Add trial numbers for each participant
+  group_by(ID) %>%
+  mutate(trial = seq_len(n()),
+         rt_sec = RT / 1000) %>%
+  ungroup %>%
+  # Keep correct responses, ignore neutral trials, discard extreme RTs
+  filter(accuracy == 1, congruency != "neutral", .2 < rt_sec, rt_sec < 2)
+```
+
+Ten random rows from the dataset:
+
+```{r}
+stroop %>% 
+  sample_n(10) %>% 
+  knitr::kable()
+```
+
+Sanity check to make sure that people contribute roughly the same numbers of
+trials.
+
+```{r}
+n_trials_per_condition_per_id <- stroop %>% count(ID, congruency)
+range(n_trials_per_condition_per_id$n)
+```
+
+
+## lme4
+
+```{r}
+# Allow intercepts to vary within participant
+model1 <- lmer(RT ~ congruency + (1 | ID), stroop)
+summary(model1)
+
+# Allow condition effect to vary within participants
+model2 <- lmer(RT ~ congruency + (congruency | ID), stroop)
+summary(model2)
+```
+
+Use a simple model comparison to test whether the two additional parameters
+improves model fit.
+
+```{r}
+anova(model1, model2)
+```
+
+Slower responders have a smaller stroop effect.
+
+```{r slope-intercept correlation}
+plot(ranef(model2))
+```
+
+
+
+## rstanarm
+
+```{r}
+refit <- FALSE
+
+# It took a couple hours to fit both of these models, so let's not refit them
+# whenever this document is generated.
+if (refit) {
+  # Allow intercepts to vary within participant
+  b_model1 <- stan_lmer(
+    formula = RT ~ congruency + (1 | ID),
+    data = stroop,
+    prior = normal(0, 5),
+    prior_covariance = decov(regularization = 1),
+    prior_intercept = normal(0, 10))
+  save(b_model1, file = "model1.Rdata")
+
+  b_model2 <- update(b_model1, formula = RT ~ congruency + (congruency | ID))
+  save(b_model2, file = "model2.Rdata")
+} else {
+  load("./model1.Rdata")
+  load("./model2.Rdata")
+}
+
+```
+
+There are too many effects for us to `summary` on each model.
+
+```{r}
+b_model1
+b_model2
+```
+
+```{r}
+posterior_interval(b_model1) %>% 
+  as.data.frame %>% 
+  tibble::rownames_to_column()
+
+# newdata <- stroop %>% 
+#   distinct(ID, congruency) %>% 
+#   filter(congruency == "congruent")
+# newdata2 <- stroop %>% 
+#   distinct(ID, congruency) %>% 
+#   filter(congruency == "incongruent")
+# 
+# posterior <- posterior_predict(b_model1, newdata) %>% 
+#   apply(2, function(xs) quantile(xs, probs = c(.025, .1, .5, .9, .975)))
+
+```
+
+
