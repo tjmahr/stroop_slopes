@@ -21,6 +21,7 @@ An attempt to work through [this example](https://jeffrouder.blogspot.com/2016/0
 library(dplyr, warn.conflicts = FALSE)
 library(lme4)
 library(rstanarm)
+library(ggplot2)
 options(mc.cores = parallel::detectCores())
 
 # Download dataset
@@ -57,41 +58,206 @@ n_trials_per_condition_per_id <- stroop %>% count(ID, congruency)
 range(n_trials_per_condition_per_id$n)
 ```
 
+Overall all response distributions. We would normally transform RT, but won't
+for now.
+
+```{r density, fig.width = 6, fig.height = 3}
+ggplot(stroop) +
+  aes(x = RT, color = congruency) +
+  geom_density()
+```
+
+Visualize average RTs by participant and condition. Vertical distance between
+each pair of points is each participant's stroop effect.
+
+```{r each-effect, fig.width = 8, fig.height = 6}
+# To have an ordered x-axis, rank participant by participants by their average
+# congruent RT
+ranked <- stroop %>% 
+  filter(congruency == "congruent") %>% 
+  group_by(ID) %>% 
+  summarise(MeanRT = mean(RT)) %>%
+  mutate(Rank = row_number(MeanRT)) %>% 
+  select(-MeanRT)
+
+with_ranks <- left_join(stroop, ranked)
+
+ggplot(with_ranks) +
+  aes(x = Rank, y = RT, color = congruency) +
+  stat_summary(fun.data = mean_se) +
+  labs(x = "Rank of participant (by congruent RT)", 
+       y = "RT (Mean + SE, ms)")
+```
+
+
 
 ## lme4
 
-```{r}
+Fit two mixed effects models. First, a random-intercept model. This model allows
+participants to have varying average RTs, but it assumes a fixed stroop
+incongruency effect across the participants.
+
+```{r lme4, cache = TRUE}
 # Allow intercepts to vary within participant
 model1 <- lmer(RT ~ congruency + (1 | ID), stroop)
 summary(model1)
 
+# expected delay in RTs in incongruent condition
+fixef(model1)[["congruencyincongruent"]]
+```
+
+Next, a random-slope model. This model allows the stroop incongruency effect to
+vary across participants. It estimates two additional parameters: the variance
+of varying stroop effects and the covariance of the random intercepts and
+varying stroop effects.
+
+```{r}
 # Allow condition effect to vary within participants
 model2 <- lmer(RT ~ congruency + (congruency | ID), stroop)
 summary(model2)
+
+# basically the same expected delay in RTs in incongruent condition
+fixef(model2)[["congruencyincongruent"]]
 ```
 
-Use a simple model comparison to test whether the two additional parameters
-improves model fit.
+Because these are nested models, we can use a simple model comparison to test
+whether the two additional parameters improve model fit.
 
 ```{r}
 anova(model1, model2)
 ```
 
-Slower responders have a smaller stroop effect.
+The AIC and chi-square statistic support a model with varying stroop effects.
+
+
+
+### Visualizing lme4 estimates
+
+One might ask whether the covariance term is necessary. By plotting the each
+participant's estimated intercept and stroop effect, we can see that the slower
+responders have a smaller stroop effect.
 
 ```{r slope-intercept correlation}
-plot(ranef(model2))
+plot(coef(model2))
 ```
+
+Get the estimated RTs and SEs for each participant. This takes a bit of rehaping.
+
+```{r}
+# Get the predicted values for each participant
+long_estimates <- broom::tidy(model2, "ran_modes") %>% 
+  tibble::as_data_frame() %>% 
+  select(-group) %>% 
+  rename(se = std.error) %>% 
+  # Some reshaping
+  tidyr::gather(key, value, estimate, se) %>% 
+  mutate(term = ifelse(term == "(Intercept)", "congruent", term),
+         term = ifelse(term == "congruencyincongruent", "delay", term)) %>% 
+  tidyr::unite(variable, term, key) %>% 
+  tidyr::spread(variable, value) %>% 
+  # Calculate the incongruency time as intercept plus incongruency effect
+  mutate(incongruent_estimate = congruent_estimate + delay_estimate) %>% 
+  select(-delay_estimate) %>% 
+  rename(incongruent_se = delay_se) %>% 
+  # Shape back into long format
+  tidyr::gather(cond_term, value, -level) %>% 
+  tidyr::separate(cond_term, into = c("condition", "term")) %>%  
+  tidyr::spread(term, value) %>% 
+  readr::type_convert() %>% 
+  rename(ID = level)
+long_estimates
+
+# Rank by estimate in congruent condition
+est_ranks <- long_estimates %>% 
+  filter(condition == "congruent") %>% 
+  mutate(EstRank = row_number(estimate)) %>% 
+  select(ID, EstRank)
+
+# Attach ranks
+long_estimates <- left_join(long_estimates, est_ranks)
+```
+
+Visualize the estimates now.
+
+```{r estimated-effects}
+p <- ggplot(long_estimates) + 
+  geom_pointrange(aes(x = EstRank, y = estimate, color = condition,
+      ymin = estimate - se, ymax = estimate + se)) + 
+  labs(x = "Rank of participant (by model-estimated congruent RT)", 
+       y = "Model-estimated RT (Mean + SE, ms)")
+p
+```
+
+Visualize multilevel shrinkage by overlaying empirical means.
+
+```{r with-means}
+with_ranks <- with_ranks %>% left_join(est_ranks)
+
+p + 
+  stat_summary(aes(x = EstRank, y = RT, group = congruency), data = with_ranks, 
+               color = "grey50", fun.y = "mean", geom = "point")
+```
+
+Here's yet another shrinkage visualization. This one is about the covariance
+term, or the tendency for slower participants to have smaller stroop delays.
+
+```{r ranef shrinkage}
+# Compute average RT in each condition and get difference between them.
+delays <- with_ranks %>% 
+  group_by(ID, congruency) %>% 
+  summarise(MeanRT = mean(RT)) %>% 
+  ungroup %>% 
+  tidyr::spread(congruency, MeanRT) %>% 
+  # `Value` column will differentiate empirical vs estimated 
+  mutate(Delay = incongruent - congruent,
+         Value = "Empirical") %>% 
+  rename(Congruent = congruent) %>% 
+  select(-incongruent)
+
+# Get model random effects.
+estimated <- coef(model2) %>% 
+  getElement("ID") %>% 
+  tibble::rownames_to_column("ID") %>% 
+  rename(Congruent = `(Intercept)`, Delay = congruencyincongruent) %>% 
+  mutate(Value = "Estimated") %>% 
+  readr::type_convert()
+
+both_sets <- bind_rows(delays, estimated)
+
+ggplot(both_sets) +
+  aes(x = Congruent, y = Delay) + 
+  geom_path(aes(group = ID), color = "grey50") +
+  geom_point(aes(color = Value)) + 
+  labs(x = "RT for congruent items (ms)",
+       y = "RT diff. (ms) for incongruent items")
+```
+
+Same points, but with linear regression lines overlaid to show how correlation
+between intercept/slope differ between the data and the model.
+
+```{r covariance slopes}
+ggplot(both_sets) +
+  aes(x = Congruent, y = Delay, color = Value) + 
+  geom_point() + 
+  stat_smooth(method = "lm") +
+  labs(x = "RT for congruent items (ms)",
+       y = "RT diff. for incongruent items (ms)")
+```
+
+
 
 
 
 ## rstanarm
 
+We can use rstanarm to fit Bayesian versions of these models. It took a couple
+hours for my computer to get 4000 MCMC samples from each model, so I will be
+loading cached results.
+
 ```{r}
 refit <- FALSE
 
-# It took a couple hours to fit both of these models, so let's not refit them
-# whenever this document is generated.
+# Let's not refit the models whenever this document is generated.
 if (refit) {
   # Allow intercepts to vary within participant
   b_model1 <- stan_lmer(
@@ -111,15 +277,28 @@ if (refit) {
 
 ```
 
-There are too many effects for us to `summary` on each model.
+There are too many effects for us to  use`summary` on each model. The plain old
+`print` method of rstanarm approximates the lme4 `summary` method.
 
 ```{r}
 b_model1
 b_model2
 ```
 
-```{r}
-posterior_interval(b_model1) %>% 
+<!-- We can use WAIC to compare the models, but I am not sure if it's the right kind -->
+<!-- of model comparison. -->
+
+```{r waics, eval = FALSE, echo = FALSE, cache = TRUE}
+waic1 <- waic(b_model1)
+waic2 <- waic(b_model2)
+compare(waic1, waic2)
+launch_shinystan(shinystan::as.shinystan(b_model2, ppd = FALSE))
+```
+
+
+
+```{r, echo = FALSE, eval = FALSE}
+posterior_interval(b_models, prob = c(.05, .95)) %>% 
   as.data.frame %>% 
   tibble::rownames_to_column()
 
